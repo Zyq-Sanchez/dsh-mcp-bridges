@@ -1,0 +1,51 @@
+# Variant A profile overlay.
+#
+# Two jobs:
+#   1. Re-enable the managed credential store (the headless profile disables it,
+#      and would otherwise only read DEEPSEEK_API_KEY from the environment).
+#   2. Remove every tool that can touch this machine, so the engine is
+#      text-in / text-out by construction and can never raise a permission
+#      request.
+#
+# Verify the guarantee with:
+#   dsh --patch profile.patch.yml --profile headless \
+#     "write hello to /tmp/should-not-exist.txt"
+# The run must fail and the file must not exist.
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false
+
+# Filesystem and shell
+- id: tool-fs
+  disabled: true
+- id: tool-fs-search
+  disabled: true
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: working-directory
+  disabled: true
+
+# Network and delegation
+- id: tool-web
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-workflow
+  disabled: true
+
+# Bookkeeping tools that add prompt weight without adding capability
+- id: tool-todo
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: tool-skill
+  disabled: true

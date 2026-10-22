@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Run artifacts (full transcripts are stored out of band)
+results/
+sessions/
+*.log
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# Caches and temporary files
+.cache/
+.caches/
+tmp/
+__pycache__/
+*.pyc
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
