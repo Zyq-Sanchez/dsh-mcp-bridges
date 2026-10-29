@@ -1,5 +1,10 @@
 # text-only — DSH as a pure text engine
 
+> **Status (2026-10-27 revision): unchanged, default-disable decision pending.**
+> This variant is not removed just because its usage is low. Whether it should be
+> disabled by default is a separate decision; until then it stays available as a
+> structurally inert text engine.
+
 Codex keeps every local capability. DSH is used as a **pure text-processing
 engine**: Codex pastes material in, DSH analyses it and returns an answer.
 
@@ -23,7 +28,8 @@ need for one — a tool-less engine has nothing to ask permission for.
 
 This is the right tool for review, explanation, summarisation and design
 critique. For anything that edits a repository, use
-[`../one-shot`](../one-shot/).
+[`../warm-session`](../warm-session/) (primary) or [`../one-shot`](../one-shot/)
+(fallback).
 
 ## Tool
 
@@ -36,7 +42,7 @@ critique. For anything that edits a repository, use
 ## Install
 
 ```toml
-[mcp_servers.dsh-text-only]
+[mcp_servers.dsh_text_only]
 command = "node"
 args = ["/absolute/path/text-only/bridge.mjs"]
 ```

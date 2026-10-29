@@ -4,7 +4,7 @@
  *
  * An MCP (Model Context Protocol) stdio server that exposes the DeepSeek Harness
  * one-shot runner (`dsh --profile headless`) as tools. Codex stays the planner and
- * decision maker; every actual bit of work is delegated to a real DSH agent run.
+ * decision maker and chooses which substantial tasks benefit from delegation.
  * When a run fails, the failure is returned as an MCP tool error so Codex sees it
  * and re-plans.
  *
@@ -17,7 +17,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -31,39 +31,43 @@ const CLI_CANDIDATES = [
 ].filter(Boolean);
 
 const DEFAULT_TIMEOUT_SEC = Number(process.env.DSH_BRIDGE_TIMEOUT_SEC || 900);
-const MAX_TIMEOUT_SEC = 7200;
+// Keep the bridge budget below the host tool_timeout_sec (3600 in the current
+// Codex config) so the bridge returns a classified error before the host kills it.
+const MAX_TIMEOUT_SEC = Math.min(Number(process.env.DSH_BRIDGE_MAX_TIMEOUT_SEC || 3300), 7200);
 const PROFILE_PATCH = path.join(HERE, 'profile.patch.yml');
 
 // Token budget: the caller's context is the scarce resource. Every reply is a
 // bounded summary; the full transcript is written to disk and readable on
 // demand through dsh_read. Tune with DSH_BRIDGE_SUMMARY_CHARS.
-const RESULTS_DIR = path.join(HERE, 'results');
-const SUMMARY_CHARS = Number(process.env.DSH_BRIDGE_SUMMARY_CHARS || 900);
+const RESULTS_DIR = path.resolve(process.env.DSH_BRIDGE_RESULTS_DIR || path.join(HERE, 'results'));
+const LOG_DIR = path.resolve(process.env.DSH_BRIDGE_LOG_DIR || path.join(HERE, 'logs'));
+// A little more room than the original 900 chars: one avoided dsh_read round trip
+// is worth far more than a few hundred summary characters. Real-DSH A/B pending.
+const SUMMARY_CHARS = Number(process.env.DSH_BRIDGE_SUMMARY_CHARS || 1500);
 const FAILURE_TAIL_LINES = 20;
 const MAX_READ_CHARS = 8000;
 const DEFAULT_READ_CHARS = 4000;
 
 const SERVER_INFO = { name: 'dsh-one-shot', version: '1.0.0' };
 const INSTRUCTIONS = [
-  'This server runs DeepSeek Harness (DSH), a full coding agent with file, shell and web tools.',
-  'Division of labour: you decide and reason; DSH executes.',
-  'For any task that needs to touch files, run commands, or verify behavior, call dsh_run with a',
-  'complete, self-contained instruction instead of doing the work with your own tools. DSH has no',
-  'memory of this conversation, so repeat the relevant context in `task`.',
-  'Reuse the returned session id with dsh_continue for follow-up work in the same context.',
-  'Responses are deliberately compact: a bounded summary, never the full transcript. The complete',
-  'output is stored under a handle and readable with dsh_read. Treat your context as the scarce',
-  'resource: read the full output only when the summary is genuinely insufficient, and prefer a',
-  'targeted dsh_continue over paging through a long transcript.',
-  'A failed run comes back as a tool error with the exit code, stderr tail and DSH session id.',
-  'That error is feedback for you: diagnose it, adjust the instruction, and call dsh_run again, or',
-  'fix the problem yourself if DSH cannot. Never report a failure as final without either one retry',
-  'through DSH or a clear explanation of why retrying cannot help.',
+  'Fallback headless DSH variant. Prefer the warm-session bridge for requirement work; use this one',
+  'when a fresh process per call is wanted or the ACP bridge is unavailable.',
+  'Use direct tools for simple reads, edits, single commands and routine checks; delegate only',
+  'substantial, well-scoped work. Batch steps into one self-contained task with acceptance checks',
+  'and prefer artifacts on disk. This variant has no task binding: continue the same objective with',
+  'dsh_continue(session_id) using the previous reply session id; start a new session for a different',
+  'objective.',
+  'Final answer format: ## 改动 / ## 验证 / ## 未解决 / ## 下一步, concise. The bridge returns the',
+  `first ${SUMMARY_CHARS} chars and stores the complete text under a handle; use dsh_read only for`,
+  'evidence the summary is missing.',
+  'Retry once only for recoverable failures; do not blindly retry a timeout. Permissions are',
+  'answered fail-closed.',
 ].join(' ');
 
 /* ------------------------------------------------------------------ plumbing */
 
 const children = new Set();
+const activeRuns = new Map(); // requestId -> { child, killTree }
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -81,6 +85,15 @@ function replyError(id, code, message, data) {
 
 function log(...parts) {
   process.stderr.write(`[dsh-one-shot] ${parts.join(' ')}\n`);
+}
+
+function appendCallLog(record) {
+  try {
+    mkdirSync(LOG_DIR, { recursive: true });
+    appendFileSync(path.join(LOG_DIR, 'calls.jsonl'), `${JSON.stringify(record)}\n`);
+  } catch {
+    /* logging must never break the call */
+  }
 }
 
 /* --------------------------------------------------------------- tool schema */
@@ -133,7 +146,7 @@ const TOOLS = [
   {
     name: 'dsh_read',
     description:
-      'Read the full stored output of an earlier run, one slice at a time. Only call this when the summary is genuinely insufficient — every call spends your context. Prefer asking DSH for a targeted follow-up over re-reading a long transcript.',
+      'Read stored output from an earlier run, one slice at a time. Use only for evidence missing from the summary; this does not call the model. Do not launch another agent turn just to retrieve existing output.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -199,7 +212,7 @@ function tail(text, lines = 40, bytes = 6000) {
   return sliced.length > bytes ? `…${sliced.slice(-bytes)}` : sliced;
 }
 
-async function runDsh({ task, cwd, timeout_sec, sessionId }) {
+async function runDsh({ task, cwd, timeout_sec, sessionId, requestId }) {
   const cli = findCli();
   const workingDir = cwd && existsSync(cwd) ? cwd : DEFAULT_CWD;
   const timeoutMs = clampTimeout(timeout_sec) * 1000;
@@ -214,17 +227,39 @@ async function runDsh({ task, cwd, timeout_sec, sessionId }) {
   if (sessionId) args.push('--session-id', sessionId);
 
   const startedAt = Date.now();
-  const child = spawn(cli, args, {
+  let child = null;
+  let timedOut = false;
+  const killTree = (signal) => {
+    if (!child?.pid) return;
+    try {
+      process.kill(-child.pid, signal);
+    } catch {
+      try {
+        child.kill(signal);
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+
+  // The timer starts before spawn so the budget covers launcher startup too.
+  const timer = setTimeout(() => {
+    timedOut = true;
+    killTree('SIGTERM');
+    setTimeout(() => killTree('SIGKILL'), 5000).unref?.();
+  }, Math.max(1, timeoutMs - (Date.now() - startedAt)));
+
+  child = spawn(cli, args, {
     cwd: workingDir,
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: true,
     env: { ...process.env, DSH_BRIDGE_CHILD: '1' },
   });
   children.add(child);
+  if (requestId !== undefined) activeRuns.set(requestId, { child, killTree });
 
   let stdout = '';
   let stderr = '';
-  let timedOut = false;
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
   child.stdout.on('data', (chunk) => {
@@ -238,30 +273,13 @@ async function runDsh({ task, cwd, timeout_sec, sessionId }) {
   child.stdin.on('error', () => {});
   child.stdin.end(task);
 
-  const killTree = (signal) => {
-    try {
-      process.kill(-child.pid, signal);
-    } catch {
-      try {
-        child.kill(signal);
-      } catch {
-        /* already gone */
-      }
-    }
-  };
-
-  const timer = setTimeout(() => {
-    timedOut = true;
-    killTree('SIGTERM');
-    setTimeout(() => killTree('SIGKILL'), 5000).unref?.();
-  }, timeoutMs);
-
   const exit = await new Promise((resolve) => {
     child.on('error', (error) => resolve({ code: null, signal: null, spawnError: error }));
     child.on('close', (code, signal) => resolve({ code, signal }));
   });
   clearTimeout(timer);
   children.delete(child);
+  if (requestId !== undefined) activeRuns.delete(requestId);
 
   const elapsedMs = Date.now() - startedAt;
   const parsed = parseEvents(stdout);
@@ -293,6 +311,8 @@ function renderFull(result) {
     if (result.failure) parts.push('', `error: ${result.failure}`);
     const err = tail(result.stderr);
     if (err) parts.push('', '--- stderr tail ---', err);
+    const raw = result.stdout ? tail(result.stdout, 40, 6000) : '';
+    if (raw) parts.push('', '--- raw stdout tail (partial events preserved) ---', raw);
   } else if (result.stderr.trim()) {
     const err = tail(result.stderr, 12, 2000);
     if (err) parts.push('', '--- stderr tail ---', err);
@@ -375,7 +395,7 @@ function renderCompact(result, handle) {
     }
     parts.push(
       '',
-      'NEXT: this execution did not succeed. Diagnose it, change the instruction, and retry with dsh_run (or dsh_continue on the same session). Only take over yourself if DSH cannot do it.',
+      'NEXT: diagnose the failure. Retry once only if it is recoverable and the next attempt addresses the cause; otherwise take over or report the blocker.',
     );
   }
   return parts.join('\n');
@@ -415,20 +435,49 @@ async function handleToolCall(id, params) {
     return;
   }
 
+  const callStarted = Date.now();
+  const logBase = {
+    ts: new Date().toISOString(),
+    received_at: new Date(callStarted).toISOString(),
+    request_id: id,
+    tool: name,
+    request_session_id: sessionId ?? null,
+    bridge: 'one-shot',
+  };
   try {
     const result = await runDsh({
       task: args.task,
       cwd: args.cwd,
       timeout_sec: args.timeout_sec,
       sessionId,
+      requestId: id,
     });
     const handle = storeResult(renderFull(result));
     reply(id, {
       content: [{ type: 'text', text: renderCompact(result, handle) }],
       isError: !result.ok,
     });
+    appendCallLog({
+      ...logBase,
+      session_id: result.sessionId ?? null,
+      status: result.ok ? 'ok' : result.timedOut ? 'timeout' : 'error',
+      bridge_ms: Date.now() - callStarted,
+      exit_code: result.code ?? null,
+      timed_out: result.timedOut === true,
+      full_chars: result.finalText ? result.finalText.length : 0,
+      stdout_chars: result.stdout ? result.stdout.length : 0,
+      stderr_chars: result.stderr ? result.stderr.length : 0,
+      handle,
+    });
   } catch (error) {
     log('execution failed:', error?.message || String(error));
+    appendCallLog({
+      ...logBase,
+      status: 'error',
+      bridge_ms: Date.now() - callStarted,
+      error_class: error?.name ?? 'Error',
+      error_message: String(error?.message || error).slice(0, 500),
+    });
     reply(id, {
       content: [{ type: 'text', text: `dsh: could not start the execution: ${error?.message || error}` }],
       isError: true,
@@ -462,13 +511,10 @@ async function onMessage(message) {
       await handleToolCall(id, params);
       return;
     case 'notifications/cancelled': {
-      for (const child of children) {
-        try {
-          process.kill(-child.pid, 'SIGTERM');
-        } catch {
-          child.kill('SIGTERM');
-        }
-      }
+      // Only the named request may be cancelled: killing every child would
+      // collateral-damage other in-flight delegations.
+      const target = activeRuns.get(params?.requestId);
+      if (target) target.killTree('SIGTERM');
       return;
     }
     default:

@@ -3,7 +3,7 @@
  * Minimal MCP client for the ACP-backed bridge.
  *
  *   node test-client.mjs                          # handshake + tools/list
- *   node test-client.mjs --run "create demo.txt"  # two calls to show warm reuse
+ *   node test-client.mjs --run "create demo.txt"  # task binding + continue + read
  */
 
 import { spawn } from 'node:child_process';
@@ -60,26 +60,35 @@ const task = process.argv.includes('--run') ? process.argv[process.argv.indexOf(
 
 if (task) {
   const first = await request('tools/call', { name: 'dsh_run', arguments: { task } });
-  console.log('\n===== dsh_run #1 =====');
+  console.log('\n===== dsh_run (new objective) =====');
   console.log(first.result.content[0].text);
 
+  const taskId = /task=(\S+)/.exec(first.result.content[0].text)?.[1];
   const handle = /full output: (run-[a-z0-9]+-\d+)/.exec(first.result.content[0].text)?.[1];
-  const session = /session (\S+)/.exec(first.result.content[0].text)?.[1];
 
-  const second = await request('tools/call', {
-    name: 'dsh_continue',
-    arguments: { session_id: session, task: '只回复一个字：收到。不要调用任何工具。' },
-  });
-  console.log('\n===== dsh_continue =====');
-  console.log(second.result.content[0].text);
-
-  if (handle) {
-    const read = await request('tools/call', {
-      name: 'dsh_read',
-      arguments: { handle, max_chars: 260 },
+  if (taskId) {
+    const second = await request('tools/call', {
+      name: 'dsh_continue',
+      arguments: { task_id: taskId, task: '只回复一个字：收到。不要调用任何工具。' },
     });
-    console.log('\n===== dsh_read =====');
-    console.log(read.result.content[0].text);
+    console.log('\n===== dsh_continue (same task_id) =====');
+    console.log(second.result.content[0].text);
+
+    const lookup = await request('tools/call', {
+      name: 'dsh_tasks',
+      arguments: { query: taskId, limit: 1 },
+    });
+    console.log('\n===== dsh_tasks =====');
+    console.log(lookup.result.content[0].text);
+
+    if (handle) {
+      const read = await request('tools/call', {
+        name: 'dsh_read',
+        arguments: { handle, max_chars: 260 },
+      });
+      console.log('\n===== dsh_read =====');
+      console.log(read.result.content[0].text);
+    }
   }
 }
 

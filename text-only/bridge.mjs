@@ -31,13 +31,10 @@ const ANSWER_BUDGET = Number(process.env.DSH_THINK_BUDGET_CHARS || 6000);
 
 const SERVER_INFO = { name: 'dsh-text-only', version: '1.0.0' };
 const INSTRUCTIONS = [
-  'This server exposes DeepSeek Harness as a pure text-processing engine.',
-  'It has no file, shell, web or agent tools: it can only read the material you send and answer.',
-  'Use it for analysis, review, summarisation, explanation and writing — not for work that needs',
-  'to touch the repository, because it structurally cannot. Keep `material` focused: only send the',
-  'excerpts the question actually needs, since everything you send is charged to your own context.',
-  'A failed call comes back as a tool error; retry once with a narrower question or do the work',
-  'yourself.',
+  'Optional DSH text analysis for substantial reviews, summaries or writing tasks.',
+  'Answer trivial questions directly; delegation adds a model round trip. This engine has no file,',
+  'shell, web or agent tools. Supply only the relevant excerpts in material and request a concise',
+  'answer. Retry once only for a recoverable failure; otherwise answer directly or report the blocker.',
 ].join(' ');
 
 /* ------------------------------------------------------------------ plumbing */
@@ -219,7 +216,7 @@ function render(result) {
   if (result.failure) parts.push(`error: ${result.failure}`);
   const err = tail(result.stderr);
   if (err) parts.push('--- stderr tail ---', err);
-  parts.push('NEXT: retry with a narrower question, or answer it yourself.');
+  parts.push('NEXT: retry once only if a changed request can resolve the failure; otherwise answer directly or report the blocker.');
   return parts.join('\n');
 }
 

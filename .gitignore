@@ -26,3 +26,8 @@ __pycache__/
 # OS / editor noise
 .DS_Store
 Thumbs.db
+
+# Additional bridge runtime artifacts
+state/
+logs/
+*.partial
